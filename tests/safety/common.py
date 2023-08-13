@@ -3,14 +3,16 @@ import abc
 import unittest
 import importlib
 import numpy as np
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from opendbc.can.packer import CANPacker  # pylint: disable=import-error
 from panda import ALTERNATIVE_EXPERIENCE
 from panda.tests.libpanda import libpanda_py
 
 MAX_WRONG_COUNTERS = 5
+VEHICLE_SPEED_FACTOR = 100
 
+MessageFunction = Callable[[float], libpanda_py.CANPacket]
 
 def sign_of(a):
   return 1 if a > 0 else -1
@@ -52,17 +54,49 @@ def add_regen_tests(cls):
 
 
 class PandaSafetyTestBase(unittest.TestCase):
+  safety: libpanda_py.Panda
+
   @classmethod
   def setUpClass(cls):
     if cls.__name__ == "PandaSafetyTestBase":
       cls.safety = None
       raise unittest.SkipTest
 
+  def _reset_safety_hooks(self):
+    self.safety.set_safety_hooks(self.safety.get_current_safety_mode(),
+                                 self.safety.get_current_safety_param())
+
   def _rx(self, msg):
     return self.safety.safety_rx_hook(msg)
 
   def _tx(self, msg):
     return self.safety.safety_tx_hook(msg)
+
+  def _generic_limit_safety_check(self, msg_function: MessageFunction, min_allowed_value: float, max_allowed_value: float,
+                                  min_possible_value: float, max_possible_value: float, test_delta: float = 1, inactive_value: float = 0,
+                                  msg_allowed = True, additional_setup: Optional[Callable[[float], None]] = None):
+    """
+      Enforces that a signal within a message is only allowed to be sent within a specific range, min_allowed_value -> max_allowed_value.
+      Tests the range of min_possible_value -> max_possible_value with a delta of test_delta.
+      Message is also only allowed to be sent when controls_allowed is true, unless the value is equal to inactive_value.
+      Message is never allowed if msg_allowed is false, for example when stock longitudinal is enabled and you are sending acceleration requests.
+      additional_setup is used for extra setup before each _tx, ex: for setting the previous torque for rate limits
+    """
+
+    # Ensure that we at least test the allowed_value range
+    self.assertGreater(max_possible_value, max_allowed_value)
+    self.assertLessEqual(min_possible_value, min_allowed_value)
+
+    for controls_allowed in [False, True]:
+      # enforce we don't skip over 0 or inactive
+      for v in np.concatenate((np.arange(min_possible_value, max_possible_value, test_delta), np.array([0, inactive_value]))):
+        v = round(v, 2)  # floats might not hit exact boundary conditions without rounding
+        self.safety.set_controls_allowed(controls_allowed)
+        if additional_setup is not None:
+          additional_setup(v)
+        should_tx = controls_allowed and min_allowed_value <= v <= max_allowed_value
+        should_tx = (should_tx or v == inactive_value) and msg_allowed
+        self.assertEqual(self._tx(msg_function(v)), should_tx, (controls_allowed, should_tx, v))
 
 
 class InterceptorSafetyTest(PandaSafetyTestBase):
@@ -156,17 +190,51 @@ class LongitudinalAccelSafetyTest(PandaSafetyTestBase, abc.ABC):
               (self.MIN_ACCEL, self.MAX_ACCEL, ALTERNATIVE_EXPERIENCE.RAISE_LONGITUDINAL_LIMITS_TO_ISO_MAX))
 
     for min_accel, max_accel, alternative_experience in limits:
-      for accel in np.arange(min_accel - 1, max_accel + 1, 0.05):
+      # enforce we don't skip over 0 or inactive accel
+      for accel in np.concatenate((np.arange(min_accel - 1, max_accel + 1, 0.05), [0, self.INACTIVE_ACCEL])):
+        accel = round(accel, 2)  # floats might not hit exact boundary conditions without rounding
         for controls_allowed in [True, False]:
           self.safety.set_controls_allowed(controls_allowed)
           self.safety.set_alternative_experience(alternative_experience)
           if stock_longitudinal:
             should_tx = False
-          elif controls_allowed:
-            should_tx = int(min_accel * 1000) <= int(accel * 1000) <= int(max_accel * 1000)
           else:
-            should_tx = np.isclose(accel, self.INACTIVE_ACCEL, atol=0.0001)
+            should_tx = controls_allowed and min_accel <= accel <= max_accel
+            should_tx = should_tx or accel == self.INACTIVE_ACCEL
           self.assertEqual(should_tx, self._tx(self._accel_msg(accel)))
+
+
+class LongitudinalGasBrakeSafetyTest(PandaSafetyTestBase, abc.ABC):
+
+  MIN_BRAKE: int = 0
+  MAX_BRAKE: Optional[int] = None
+  MAX_POSSIBLE_BRAKE: Optional[int] = None
+
+  MIN_GAS: int = 0
+  MAX_GAS: Optional[int] = None
+  INACTIVE_GAS = 0
+  MAX_POSSIBLE_GAS: Optional[int] = None
+
+  def test_gas_brake_limits_correct(self):
+    self.assertIsNotNone(self.MAX_POSSIBLE_BRAKE)
+    self.assertIsNotNone(self.MAX_POSSIBLE_GAS)
+
+    self.assertGreater(self.MAX_BRAKE, self.MIN_BRAKE)
+    self.assertGreater(self.MAX_GAS, self.MIN_GAS)
+
+  @abc.abstractmethod
+  def _send_gas_msg(self, gas: int):
+    pass
+
+  @abc.abstractmethod
+  def _send_brake_msg(self, brake: int):
+    pass
+
+  def test_brake_safety_check(self):
+    self._generic_limit_safety_check(self._send_brake_msg, self.MIN_BRAKE, self.MAX_BRAKE, 0, self.MAX_POSSIBLE_BRAKE, 1)
+
+  def test_gas_safety_check(self):
+    self._generic_limit_safety_check(self._send_gas_msg, self.MIN_GAS, self.MAX_GAS, 0, self.MAX_POSSIBLE_GAS, 1, self.INACTIVE_GAS)
 
 
 class TorqueSteeringSafetyTestBase(PandaSafetyTestBase, abc.ABC):
@@ -198,7 +266,7 @@ class TorqueSteeringSafetyTestBase(PandaSafetyTestBase, abc.ABC):
 
   def test_steer_safety_check(self):
     for enabled in [0, 1]:
-      for t in range(-self.MAX_TORQUE * 2, self.MAX_TORQUE * 2):
+      for t in range(int(-self.MAX_TORQUE * 1.5), int(self.MAX_TORQUE * 1.5)):
         self.safety.set_controls_allowed(enabled)
         self._set_prev_torque(t)
         if abs(t) > self.MAX_TORQUE or (not enabled and abs(t) > 0):
@@ -329,9 +397,14 @@ class DriverTorqueSteeringSafetyTest(TorqueSteeringSafetyTestBase, abc.ABC):
 
   @classmethod
   def setUpClass(cls):
+    super().setUpClass()
     if cls.__name__ == "DriverTorqueSteeringSafetyTest":
       cls.safety = None
       raise unittest.SkipTest
+
+  @abc.abstractmethod
+  def _torque_driver_msg(self, torque):
+    pass
 
   def test_non_realtime_limit_up(self):
     self.safety.set_torque_driver(0, 0)
@@ -397,6 +470,17 @@ class DriverTorqueSteeringSafetyTest(TorqueSteeringSafetyTestBase, abc.ABC):
       self.safety.set_timer(self.RT_INTERVAL + 1)
       self.assertTrue(self._tx(self._torque_cmd_msg(sign * (self.MAX_RT_DELTA - 1))))
       self.assertTrue(self._tx(self._torque_cmd_msg(sign * (self.MAX_RT_DELTA + 1))))
+
+  def test_reset_driver_torque_measurements(self):
+    # Tests that the driver torque measurement sample_t is reset on safety mode init
+    for t in np.linspace(-self.MAX_TORQUE, self.MAX_TORQUE, 6):
+      self.assertTrue(self._rx(self._torque_driver_msg(t)))
+
+    # reset sample_t by reinitializing the safety mode
+    self._reset_safety_hooks()
+
+    self.assertEqual(self.safety.get_torque_driver_min(), 0)
+    self.assertEqual(self.safety.get_torque_driver_max(), 0)
 
 
 class MotorTorqueSteeringSafetyTest(TorqueSteeringSafetyTestBase, abc.ABC):
@@ -504,14 +588,60 @@ class MotorTorqueSteeringSafetyTest(TorqueSteeringSafetyTestBase, abc.ABC):
     self.assertTrue(self.safety.get_torque_meas_min() in min_range)
     self.assertTrue(self.safety.get_torque_meas_max() in max_range)
 
+  def test_reset_torque_measurements(self):
+    # Tests that the torque measurement sample_t is reset on safety mode init
+    for t in np.linspace(-self.MAX_TORQUE, self.MAX_TORQUE, 6):
+      self.assertTrue(self._rx(self._torque_meas_msg(t)))
 
-class AngleSteeringSafetyTest(PandaSafetyTestBase):
+    # reset sample_t by reinitializing the safety mode
+    self._reset_safety_hooks()
 
-  DEG_TO_CAN: int
+    self.assertEqual(self.safety.get_torque_meas_min(), 0)
+    self.assertEqual(self.safety.get_torque_meas_max(), 0)
 
-  ANGLE_DELTA_BP: List[float]
-  ANGLE_DELTA_V: List[float]  # windup limit
-  ANGLE_DELTA_VU: List[float]  # unwind limit
+class MeasurementSafetyTest(PandaSafetyTestBase):
+  DEG_TO_CAN: float = 1
+
+  @classmethod
+  def setUpClass(cls):
+    if cls.__name__ == "MeasurementSafetyTest":
+      cls.safety = None
+      raise unittest.SkipTest
+
+  @abc.abstractmethod
+  def _angle_meas_msg(self, angle: float):
+    pass
+
+  @abc.abstractmethod
+  def _speed_msg(self, speed):
+    pass
+
+  def common_measurement_test(self, msg_func, min_value, max_value, factor, get_min_func, get_max_func):
+    for val in np.arange(min_value, max_value, 0.5):
+      for i in range(6):
+        self.assertTrue(self._rx(msg_func(val + i * 0.1)))
+
+      # assert close by one decimal place
+      self.assertLessEqual(abs(get_min_func() - val * factor), 1 * abs(factor))
+      self.assertLessEqual(abs(get_max_func() - (val + 0.5) * factor), 1 * abs(factor))
+
+      # reset sample_t by reinitializing the safety mode
+      self._reset_safety_hooks()
+
+      self.assertEqual(get_min_func(), 0)
+      self.assertEqual(get_max_func(), 0)
+
+  def test_vehicle_speed_measurements(self):
+    self.common_measurement_test(self._speed_msg, 0, 80, VEHICLE_SPEED_FACTOR, self.safety.get_vehicle_speed_min, self.safety.get_vehicle_speed_max)
+
+  def test_steering_angle_measurements(self):
+    self.common_measurement_test(self._angle_meas_msg, -180, 180, self.DEG_TO_CAN, self.safety.get_angle_meas_min, self.safety.get_angle_meas_max)
+
+
+class AngleSteeringSafetyTest(MeasurementSafetyTest):
+  ANGLE_RATE_BP: List[float]
+  ANGLE_RATE_UP: List[float]  # windup limit
+  ANGLE_RATE_DOWN: List[float]  # unwind limit
 
   @classmethod
   def setUpClass(cls):
@@ -523,17 +653,17 @@ class AngleSteeringSafetyTest(PandaSafetyTestBase):
   def _angle_cmd_msg(self, angle: float, enabled: bool):
     pass
 
-  @abc.abstractmethod
-  def _angle_meas_msg(self, angle: float):
-    pass
-
   def _set_prev_desired_angle(self, t):
     t = int(t * self.DEG_TO_CAN)
     self.safety.set_desired_angle_last(t)
 
-  def _angle_meas_msg_array(self, angle):
+  def _reset_angle_measurement(self, angle):
     for _ in range(6):
       self._rx(self._angle_meas_msg(angle))
+
+  def _reset_speed_measurement(self, speed):
+    for _ in range(6):
+      self._rx(self._speed_msg(speed))
 
   def test_angle_cmd_when_enabled(self):
     # when controls are allowed, angle cmd rate limit is enforced
@@ -541,12 +671,12 @@ class AngleSteeringSafetyTest(PandaSafetyTestBase):
     angles = [-300, -100, -10, 0, 10, 100, 300]
     for a in angles:
       for s in speeds:
-        max_delta_up = np.interp(s, self.ANGLE_DELTA_BP, self.ANGLE_DELTA_V)
-        max_delta_down = np.interp(s, self.ANGLE_DELTA_BP, self.ANGLE_DELTA_VU)
+        max_delta_up = np.interp(s, self.ANGLE_RATE_BP, self.ANGLE_RATE_UP)
+        max_delta_down = np.interp(s, self.ANGLE_RATE_BP, self.ANGLE_RATE_DOWN)
 
         # first test against false positives
-        self._angle_meas_msg_array(a)
-        self._rx(self._speed_msg(s))  # pylint: disable=no-member
+        self._reset_angle_measurement(a)
+        self._reset_speed_measurement(s)
 
         self._set_prev_desired_angle(a)
         self.safety.set_controls_allowed(1)
@@ -583,11 +713,21 @@ class AngleSteeringSafetyTest(PandaSafetyTestBase):
         self.assertTrue(self._tx(self._angle_cmd_msg(a, False)))
 
   def test_angle_cmd_when_disabled(self):
-    self.safety.set_controls_allowed(0)
+    # Tests that only angles close to the meas are allowed while
+    # steer actuation bit is 0, regardless of controls allowed.
+    for controls_allowed in (True, False):
+      self.safety.set_controls_allowed(controls_allowed)
 
-    self._set_prev_desired_angle(0)
-    self.assertFalse(self._tx(self._angle_cmd_msg(0, True)))
-    self.assertFalse(self.safety.get_controls_allowed())
+      for steer_control_enabled in (True, False):
+        for angle_meas in np.arange(-90, 91, 10):
+          self._reset_angle_measurement(angle_meas)
+
+          for angle_cmd in np.arange(-90, 91, 10):
+            self._set_prev_desired_angle(angle_cmd)
+
+            # controls_allowed is checked if actuation bit is 1, else the angle must be close to meas (inactive)
+            should_tx = controls_allowed if steer_control_enabled else angle_cmd == angle_meas
+            self.assertEqual(should_tx, self._tx(self._angle_cmd_msg(angle_cmd, steer_control_enabled)))
 
 
 @add_regen_tests
@@ -654,18 +794,17 @@ class PandaSafetyTest(PandaSafetyTestBase):
     for bus in range(0, 3):
       for addr in self.SCANNED_ADDRS:
         self.assertEqual(-1, self._tx(make_msg(bus, addr, 8)))
-        self.assertEqual(-1, self.safety.safety_fwd_hook(bus, make_msg(bus, addr, 8)))
+        self.assertEqual(-1, self.safety.safety_fwd_hook(bus, addr))
 
   def test_fwd_hook(self):
     # some safety modes don't forward anything, while others blacklist msgs
     for bus in range(0, 3):
       for addr in self.SCANNED_ADDRS:
         # assume len 8
-        msg = make_msg(bus, addr, 8)
         fwd_bus = self.FWD_BUS_LOOKUP.get(bus, -1)
         if bus in self.FWD_BLACKLISTED_ADDRS and addr in self.FWD_BLACKLISTED_ADDRS[bus]:
           fwd_bus = -1
-        self.assertEqual(fwd_bus, self.safety.safety_fwd_hook(bus, msg), f"{addr=:#x} from {bus=} to {fwd_bus=}")
+        self.assertEqual(fwd_bus, self.safety.safety_fwd_hook(bus, addr), f"{addr=:#x} from {bus=} to {fwd_bus=}")
 
   def test_spam_can_buses(self):
     for bus in range(0, 4):
@@ -785,15 +924,15 @@ class PandaSafetyTest(PandaSafetyTestBase):
     self.assertFalse(self.safety.get_vehicle_moving())
 
     # not moving
-    self.safety.safety_rx_hook(self._vehicle_moving_msg(0))
+    self._rx(self._vehicle_moving_msg(0))
     self.assertFalse(self.safety.get_vehicle_moving())
 
     # speed is at threshold
-    self.safety.safety_rx_hook(self._vehicle_moving_msg(self.STANDSTILL_THRESHOLD))
+    self._rx(self._vehicle_moving_msg(self.STANDSTILL_THRESHOLD))
     self.assertFalse(self.safety.get_vehicle_moving())
 
     # past threshold
-    self.safety.safety_rx_hook(self._vehicle_moving_msg(self.STANDSTILL_THRESHOLD + 1))
+    self._rx(self._vehicle_moving_msg(self.STANDSTILL_THRESHOLD + 1))
     self.assertTrue(self.safety.get_vehicle_moving())
 
   def test_tx_hook_on_wrong_safety_mode(self):
@@ -807,18 +946,21 @@ class PandaSafetyTest(PandaSafetyTestBase):
       test = importlib.import_module("panda.tests.safety."+tf[:-3])
       for attr in dir(test):
         if attr.startswith("Test") and attr != current_test:
-          tx = getattr(getattr(test, attr), "TX_MSGS")
+          tc = getattr(test, attr)
+          tx = tc.TX_MSGS
           if tx is not None and not attr.endswith('Base'):
             # No point in comparing different Tesla safety modes
             if 'Tesla' in attr and 'Tesla' in current_test:
               continue
             if attr.startswith('TestToyota') and current_test.startswith('TestToyota'):
               continue
-            if {attr, current_test}.issubset({'TestSubaruSafety', 'TestSubaruGen2Safety'}):
+            if {attr, current_test}.issubset({'TestSubaruGen1Safety', 'TestSubaruGen2Safety'}):
               continue
             if {attr, current_test}.issubset({'TestVolkswagenPqSafety', 'TestVolkswagenPqStockSafety', 'TestVolkswagenPqLongSafety'}):
               continue
             if {attr, current_test}.issubset({'TestGmCameraSafety', 'TestGmCameraLongitudinalSafety'}):
+              continue
+            if attr.startswith('TestFord') and current_test.startswith('TestFord'):
               continue
             if attr.startswith('TestHyundaiCanfd') and current_test.startswith('TestHyundaiCanfd'):
               continue
@@ -835,6 +977,10 @@ class PandaSafetyTest(PandaSafetyTestBase):
 
             # Volkswagen MQB and Honda Nidec ACC HUD messages overlap
             if attr == 'TestVolkswagenMqbLongSafety' and current_test.startswith('TestHondaNidec'):
+              tx = list(filter(lambda m: m[0] not in [0x30c, ], tx))
+
+            # Volkswagen MQB and Honda Bosch Radarless ACC HUD messages overlap
+            if attr == 'TestVolkswagenMqbLongSafety' and current_test.startswith('TestHondaBoschRadarless'):
               tx = list(filter(lambda m: m[0] not in [0x30c, ], tx))
 
             # TODO: Temporary, should be fixed in panda firmware, safety_honda.h

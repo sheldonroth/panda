@@ -103,20 +103,20 @@ static int toyota_rx_hook(CANPacket_t *to_push) {
 
       // sample gas pedal
       if (!gas_interceptor_detected) {
-        gas_pressed = ((GET_BYTE(to_push, 0) >> 4) & 1U) == 0U;
+        gas_pressed = GET_BIT(to_push, 4U) == 0U;
       }
     }
 
     if (addr == 0xaa) {
       // check that all wheel speeds are at zero value with offset
-      bool standstill = (GET_BYTES_04(to_push) == 0x6F1A6F1AU) && (GET_BYTES_48(to_push) == 0x6F1A6F1AU);
+      bool standstill = (GET_BYTES(to_push, 0, 4) == 0x6F1A6F1AU) && (GET_BYTES(to_push, 4, 4) == 0x6F1A6F1AU);
       vehicle_moving = !standstill;
     }
 
     // most cars have brake_pressed on 0x226, corolla and rav4 on 0x224
     if (((addr == 0x224) && toyota_alt_brake) || ((addr == 0x226) && !toyota_alt_brake)) {
-      int byte = (addr == 0x224) ? 0 : 4;
-      brake_pressed = ((GET_BYTE(to_push, byte) >> 5) & 1U) != 0U;
+      uint8_t bit = (addr == 0x224) ? 5U : 37U;
+      brake_pressed = GET_BIT(to_push, bit) != 0U;
     }
 
     // sample gas interceptor
@@ -181,7 +181,7 @@ static int toyota_tx_hook(CANPacket_t *to_send) {
     // AEB: block all actuation. only used when DSU is unplugged
     if (addr == 0x283) {
       // only allow the checksum, which is the last byte
-      bool block = (GET_BYTES_04(to_send) != 0U) || (GET_BYTE(to_send, 4) != 0U) || (GET_BYTE(to_send, 5) != 0U);
+      bool block = (GET_BYTES(to_send, 0, 4) != 0U) || (GET_BYTE(to_send, 4) != 0U) || (GET_BYTE(to_send, 5) != 0U);
       if (block) {
         tx = 0;
       }
@@ -191,8 +191,8 @@ static int toyota_tx_hook(CANPacket_t *to_send) {
     // only sent to prevent dash errors, no actuation is accepted
     if (addr == 0x191) {
       // check the STEER_REQUEST, STEER_REQUEST_2, SETME_X64 STEER_ANGLE_CMD signals
-      bool lta_request = (GET_BYTE(to_send, 0) & 1U) != 0U;
-      bool lta_request2 = ((GET_BYTE(to_send, 3) >> 1) & 1U) != 0U;
+      bool lta_request = GET_BIT(to_send, 0U) != 0U;
+      bool lta_request2 = GET_BIT(to_send, 25U) != 0U;
       int setme_x64 = GET_BYTE(to_send, 5);
       int lta_angle = (GET_BYTE(to_send, 1) << 8) | GET_BYTE(to_send, 2);
       lta_angle = to_signed(lta_angle, 16);
@@ -235,7 +235,7 @@ static const addr_checks* toyota_init(uint16_t param) {
   return &toyota_rx_checks;
 }
 
-static int toyota_fwd_hook(int bus_num, CANPacket_t *to_fwd) {
+static int toyota_fwd_hook(int bus_num, int addr) {
 
   int bus_fwd = -1;
 
@@ -244,7 +244,6 @@ static int toyota_fwd_hook(int bus_num, CANPacket_t *to_fwd) {
   }
 
   if (bus_num == 2) {
-    int addr = GET_ADDR(to_fwd);
     // block stock lkas messages and stock acc messages (if OP is doing ACC)
     // in TSS2, 0x191 is LTA which we need to block to avoid controls collision
     int is_lkas_msg = ((addr == 0x2E4) || (addr == 0x412) || (addr == 0x191));
