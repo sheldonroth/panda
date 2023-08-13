@@ -1,3 +1,45 @@
+#include <stdint.h>
+
+const uint8_t FIXED_KEY[16] = {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11};
+
+uint32_t generate_mac(const CANPacket_t *message) {
+  // Use the FIXED_KEY and the appropriate cryptographic algorithm to generate the MAC
+  // ...
+
+  // Truncate the MAC to 28 bits
+  uint32_t truncated_mac = mac & 0xFFFFFFF;
+
+  return truncated_mac;
+}
+
+static int toyota_tx_hook(CANPacket_t *to_send) {
+  // Generate the truncated MAC using the fixed key
+  uint32_t mac = generate_mac(to_send);
+
+  // Append the truncated MAC to the message
+  // ...
+
+  // Existing code for sending the message
+  // ...
+}
+
+static int toyota_rx_hook(CANPacket_t *to_push) {
+  // Extract the truncated MAC from the received message
+  uint32_t received_mac = extract_mac(to_push);
+
+  // Generate the expected truncated MAC using the fixed key
+  uint32_t expected_mac = generate_mac(to_push);
+
+  if (received_mac != expected_mac) {
+    // Handle MAC verification failure (e.g., log an error, ignore the message)
+    return 0;
+  }
+
+  // Existing code for processing the received message
+  // ...
+}
+
+// Rest of the code remains unchanged
 const SteeringLimits TOYOTA_STEERING_LIMITS = {
   .max_steer = 1500,
   .max_rate_up = 15,          // ramp up slow
